@@ -1,0 +1,11 @@
+[submodule "gateway"]
+	path = gateway
+	url = https://github.com/MichalGurin/llm-gateway.git
+
+[submodule "rag-chain"]
+	path = rag-chain
+	url = https://github.com/MichalGurin/rag-chain.git
+
+[submodule "mcp-server-sandbox"]
+	path = mcp-server-sandbox
+	url = https://github.com/MichalGurin/mcp-server-sandbox.git

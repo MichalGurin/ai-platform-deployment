@@ -1,0 +1,280 @@
+# Unified AI platform: AI Quality & Safety Gateway + RAG chain + SandboxMCP.
+#
+# Single deployment that composes all three parts from their public repositories:
+#   gateway           -> https://github.com/MichalGurin/llm-gateway
+#   rag-chain         -> https://github.com/MichalGurin/rag-chain
+#   mcp-server-sandbox -> https://github.com/MichalGurin/mcp-server-sandbox
+#
+# The unified LLM traffic path is:
+#   clients / RAG API / coding agents -> llm-gateway (/v1/chat/completions, /v1/embeddings)
+#                                     -> local OpenAI-compatible backend (Ollama / vLLM / llama.cpp)
+
+services:
+  gateway:
+    build:
+      context: ./gateway
+    ports:
+      - "8000:8000"
+      - "50051:50051"
+    environment:
+      APP_NAME: ai-quality-gateway
+      ENVIRONMENT: development
+      LOG_LEVEL: INFO
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:?Set GATEWAY_API_KEY before starting Compose}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_DEFAULT_MODEL: ${OPENAI_DEFAULT_MODEL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_DEFAULT_MODEL: ${ANTHROPIC_DEFAULT_MODEL:-}
+      DEFAULT_PROVIDER: ${DEFAULT_PROVIDER:-local}
+      LOCAL_BASE_URL: ${LOCAL_BASE_URL:-http://ollama:11434/v1}
+      LOCAL_MODEL: ${LOCAL_MODEL:-llama3.2:1b}
+      SAFETY_ENABLED: "true"
+      SAFETY_REDACT_PII: "true"
+      SAFETY_BLOCK_INJECTIONS: "true"
+      RATE_LIMIT_ENABLED: "true"
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: rag
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      start_period: 20s
+      retries: 5
+    restart: unless-stopped
+
+  ollama-model-init:
+    image: ollama/ollama:latest
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        ollama pull "$${PRIMARY_MODEL}"
+        if [ "$${FALLBACK_MODEL}" != "$${PRIMARY_MODEL}" ]; then ollama pull "$${FALLBACK_MODEL}"; fi
+        ollama pull "$${EMBEDDING_MODEL}"
+    environment:
+      PRIMARY_MODEL: "${PRIMARY_MODEL:-llama3.2:1b}"
+      FALLBACK_MODEL: "${FALLBACK_MODEL:-llama3.2:1b}"
+      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-nomic-embed-text}"
+      OLLAMA_HOST: http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+  uploads-init:
+    image: alpine:3.22
+    command: ["sh", "-c", "chown -R 10001:10001 /data/uploads"]
+    volumes:
+      - uploads:/data/uploads
+    restart: "no"
+
+  frontend:
+    build:
+      context: ./rag-chain/frontend
+      target: development
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+      API_PROXY_TARGET: http://agent-api:8000
+    ports:
+      - "127.0.0.1:5173:5173"
+    volumes:
+      - ./rag-chain/frontend/src:/app/src
+      - ./rag-chain/frontend/index.html:/app/index.html
+    depends_on:
+      agent-api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:5173').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+    restart: unless-stopped
+
+  agent-api:
+    build:
+      context: ./rag-chain
+      dockerfile: app/Dockerfile
+    env_file:
+      - path: ./rag-chain/.env
+        required: false
+    environment:
+      APP_ENV: development
+      DATABASE_URL: "postgresql+psycopg://rag:rag@db:5432/rag"
+      LLM_BASE_URL: http://gateway:8000/v1
+      LLM_API_KEY: ${GATEWAY_API_KEY:?Set GATEWAY_API_KEY before starting Compose}
+      REDIS_URL: redis://redis:6379/0
+      UPLOAD_DIR: /data/uploads
+    volumes:
+      - uploads:/data/uploads
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      uploads-init:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      ollama-model-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      gateway:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+
+  ingestion-worker:
+    build:
+      context: ./rag-chain
+      dockerfile: app/Dockerfile
+    env_file:
+      - path: ./rag-chain/.env
+        required: false
+    environment:
+      APP_ENV: development
+      DATABASE_URL: "postgresql+psycopg://rag:rag@db:5432/rag"
+      LLM_BASE_URL: http://gateway:8000/v1
+      LLM_API_KEY: ${GATEWAY_API_KEY:?Set GATEWAY_API_KEY before starting Compose}
+      REDIS_URL: redis://redis:6379/0
+      UPLOAD_DIR: /data/uploads
+    command:
+      [
+        "celery",
+        "-A",
+        "app.ingestion.tasks.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=2",
+        "--queues=document-ingestion",
+      ]
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      uploads-init:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      ollama-model-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      agent-api:
+        condition: service_healthy
+      gateway:
+        condition: service_started
+    restart: unless-stopped
+
+  job-dispatcher:
+    build:
+      context: ./rag-chain
+      dockerfile: app/Dockerfile
+    env_file:
+      - path: ./rag-chain/.env
+        required: false
+    environment:
+      APP_ENV: development
+      DATABASE_URL: "postgresql+psycopg://rag:rag@db:5432/rag"
+      REDIS_URL: redis://redis:6379/0
+    command:
+      [
+        "celery",
+        "-A",
+        "app.ingestion.tasks.celery_app",
+        "beat",
+        "--loglevel=INFO",
+        "--schedule=/tmp/celerybeat-schedule",
+      ]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      agent-api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mcp:
+    build:
+      context: ./mcp-server-sandbox
+    ports:
+      - "127.0.0.1:8001:8000"
+    environment:
+      SANDBOX_MCP_TRANSPORT: http
+      SANDBOX_DB_URL: postgresql+psycopg://rag:rag@db:5432/rag
+      SANDBOX_LOG_FILE: /var/log/sandbox/service.log
+      SANDBOX_DOCKER_IMAGE: python:3.14-slim
+      SANDBOX_DOCKER_MEMORY_MB: 256
+      SANDBOX_DOCKER_CPU_CORES: 0.5
+      SANDBOX_TEST_TIMEOUT_SECONDS: 30
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - sandbox_logs:/var/log/sandbox
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  ollama:
+  redisdata:
+  uploads:
+  sandbox_logs:
